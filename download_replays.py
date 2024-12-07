@@ -1,4 +1,4 @@
-from steam_login import load_cookies, create_visible_driver
+from steam_login import load_cookies, create_driver, ensure_login, verify_login
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
@@ -12,30 +12,40 @@ import json
 from bs4 import BeautifulSoup
 import traceback
 import requests
+import bz2
+import shutil
 
 MATCH_HISTORY_URL = "https://steamcommunity.com/my/gcpd/730?tab=matchhistorypremier"
 DOWNLOAD_DIR = "replays"
 MAX_CONCURRENT_DOWNLOADS = 5  # Adjust this based on your internet connection
 TIMEOUT = ClientTimeout(total=300)  # 5 minutes timeout for each download
 
-def setup_driver():
-    driver = create_visible_driver()
+def setup_driver(headless=True):
+    """Setup Chrome driver with cookies"""
+    driver = create_driver(headless=headless)
     cookies = load_cookies()
     
     if not cookies:
-        raise Exception("No cookies found. Please run steam_login.py first.")
+        raise Exception("No cookies found - login required")
     
     # Visit Steam domain first (required for cookie setting)
     driver.get('https://steamcommunity.com')
     
     # Add saved cookies
     for cookie in cookies:
-        driver.add_cookie(cookie)
+        try:
+            driver.add_cookie(cookie)
+        except Exception as e:
+            print(f"Warning: Could not add cookie: {str(e)}")
+    
+    # Verify login worked
+    if not verify_login(driver):
+        raise Exception("Login verification failed")
     
     return driver
 
 async def download_file(session, url, filepath, pbar):
-    if os.path.exists(filepath):
+    if os.path.exists(filepath.replace('.bz2', '')):  # Check for existing .dem file
         pbar.update(1)
         return True
 
@@ -48,6 +58,14 @@ async def download_file(session, url, filepath, pbar):
                         if not chunk:
                             break
                         f.write(chunk)
+                
+                # Decompress the file after successful download
+                if filepath.endswith('.bz2'):
+                    if decompress_bz2(filepath):
+                        print(f"Decompressed {filepath}")
+                    else:
+                        print(f"Failed to decompress {filepath}")
+                
                 pbar.update(1)
                 return True
             else:
@@ -154,7 +172,7 @@ def find_download_buttons(match_container):
         print(f"Error finding download buttons: {str(e)}")
         return []
 
-def get_download_links(driver):
+def get_download_links(driver, status_callback=None):
     wait = WebDriverWait(driver, 10)
     processed_urls = set()  # Track processed URLs
     previous_matches_count = 0
@@ -256,11 +274,32 @@ def get_download_links(driver):
             
     return processed_urls
 
+def decompress_bz2(bz2_path):
+    """Decompress a .bz2 file and remove the original compressed file"""
+    dem_path = bz2_path.replace('.bz2', '')
+    try:
+        with bz2.BZ2File(bz2_path, 'rb') as source:
+            with open(dem_path, 'wb') as dest:
+                shutil.copyfileobj(source, dest)
+        # Remove the original .bz2 file
+        os.remove(bz2_path)
+        print(f"Successfully decompressed: {dem_path}")
+        return True
+    except Exception as e:
+        print(f"Error decompressing {bz2_path}: {str(e)}")
+        return False
+
 def download_replay(url, filepath):
     """Download a single replay file"""
     try:
         print(f"\nStarting download of {url}")
         print(f"Saving to: {filepath}")
+        
+        # Check if decompressed file already exists
+        dem_path = filepath.replace('.bz2', '')
+        if os.path.exists(dem_path):
+            print(f"Decompressed file already exists: {dem_path}")
+            return True
         
         # Add headers to mimic browser request
         headers = {
@@ -279,16 +318,30 @@ def download_replay(url, filepath):
         # Download with progress tracking
         block_size = 1024  # 1 Kibibyte
         downloaded = 0
+        last_printed_progress = 0
         
         with open(filepath, 'wb') as f:
             for data in response.iter_content(block_size):
                 downloaded += len(data)
                 f.write(data)
                 # Calculate progress
-                progress = (downloaded / total_size) * 100 if total_size else 0
-                print(f"Download progress: {progress:.1f}%", end='\r')
-                
+                progress = int((downloaded / total_size) * 100) if total_size else 0
+                # Only print if progress has changed by at least 1%
+                if progress != last_printed_progress:
+                    print(f"Download progress: {progress}%", end='\r')
+                    last_printed_progress = progress
+        
         print(f"\nSuccessfully downloaded {filepath}")
+        
+        # Decompress the file after successful download
+        if filepath.endswith('.bz2'):
+            if decompress_bz2(filepath):
+                print(f"Successfully decompressed {filepath}")
+                return True
+            else:
+                print(f"Failed to decompress {filepath}")
+                return False
+        
         return True
         
     except requests.exceptions.RequestException as e:
@@ -302,26 +355,43 @@ def download_replay(url, filepath):
             os.remove(filepath)  # Clean up partial download
         return False
 
-def download_replays():
-    driver = setup_driver()
+def download_replays(status_callback=None):
+    """Main function to download CS:GO replays"""
     try:
-        # Create downloads directory if it doesn't exist
+        # Create downloads directory
         os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-        print(f"\nDownload directory: {os.path.abspath(DOWNLOAD_DIR)}")
+        if status_callback:
+            status_callback(f"Download directory: {os.path.abspath(DOWNLOAD_DIR)}")
         
-        # Navigate to match history page
-        print("\nNavigating to match history...")
-        driver.get(MATCH_HISTORY_URL)
+        # Setup driver and download replays
+        if status_callback:
+            status_callback("Setting up browser...")
+        driver = setup_driver(headless=True)
         
-        # Process matches and download replays
-        processed_urls = get_download_links(driver)
-        print(f"\nFinished processing {len(processed_urls)} matches")
-        
+        try:
+            if status_callback:
+                status_callback("Navigating to match history...")
+            driver.get(MATCH_HISTORY_URL)
+            
+            # Wait for the match history to load
+            WebDriverWait(driver, 10).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, "table.csgo_scoreboard_root"))
+            )
+            
+            processed_urls = get_download_links(driver, status_callback)
+            if status_callback:
+                status_callback(f"Finished processing {len(processed_urls)} matches")
+            
+        finally:
+            driver.quit()
+            
     except Exception as e:
-        print(f"Error in download_replays: {str(e)}")
+        error_msg = f"Error in download_replays: {str(e)}"
+        if status_callback:
+            status_callback(error_msg)
+        print(error_msg)
         print(f"Traceback: {traceback.format_exc()}")
-    finally:
-        driver.quit()
+        raise
 
 if __name__ == "__main__":
     download_replays()
