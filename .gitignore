@@ -1,2 +1,5 @@
 .env
 *.pkl
+*.html
+/replays
+/__pycache__
